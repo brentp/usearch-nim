@@ -20,6 +20,9 @@
 
 using namespace unum::usearch;
 
+static_assert(USEARCH_Q4_DIMENSIONS > 0 && USEARCH_Q4_DIMENSIONS % 2 == 0,
+              "USEARCH_Q4_DIMENSIONS must be a positive even number");
+
 using usearch_q4_dense_t = index_dense_gt<std::uint32_t, std::uint32_t>;
 
 struct usearch_q4_index {
@@ -77,16 +80,23 @@ static std::uint32_t read_u32_le(std::uint8_t const* bytes) noexcept {
            (static_cast<std::uint32_t>(bytes[3]) << 24);
 }
 
-static std::int32_t packed_dot_scalar(std::uint8_t const* first,
-                                     std::uint8_t const* second) noexcept {
+// Dot product over packed bytes [begin, end). Also serves as the tail of the
+// AVX2 kernel when the record does not divide evenly into 32-byte blocks.
+static std::int32_t packed_dot_range(std::uint8_t const* first, std::uint8_t const* second,
+                                     std::size_t begin, std::size_t end) noexcept {
     std::int32_t dot = 0;
-    for (std::size_t i = 0; i != USEARCH_Q4_PACKED_BYTES; ++i) {
+    for (std::size_t i = begin; i != end; ++i) {
         std::uint8_t a = first[i];
         std::uint8_t b = second[i];
         dot += decode_nibble(a & 0x0f) * decode_nibble(b & 0x0f);
         dot += decode_nibble(a >> 4) * decode_nibble(b >> 4);
     }
     return dot;
+}
+
+static std::int32_t packed_dot_scalar(std::uint8_t const* first,
+                                     std::uint8_t const* second) noexcept {
+    return packed_dot_range(first, second, 0, USEARCH_Q4_PACKED_BYTES);
 }
 
 #if USEARCH_Q4_CAN_DISPATCH_AVX2
@@ -97,7 +107,11 @@ static std::int32_t packed_dot_avx2(std::uint8_t const* first,
     __m256i const nibble_mask = _mm256_set1_epi8(0x0f);
     __m256i const sign_bit = _mm256_set1_epi8(0x08);
 
-    for (std::size_t offset = 0; offset != USEARCH_Q4_PACKED_BYTES; offset += 32) {
+    // Whole 32-byte blocks only; a configured dimension count need not divide
+    // evenly, so the remainder is finished by the scalar range helper below.
+    constexpr std::size_t vector_bytes = (USEARCH_Q4_PACKED_BYTES / 32) * 32;
+
+    for (std::size_t offset = 0; offset != vector_bytes; offset += 32) {
         __m256i a = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(first + offset));
         __m256i b = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(second + offset));
         __m256i a_low = _mm256_and_si256(a, nibble_mask);
@@ -123,7 +137,8 @@ static std::int32_t packed_dot_avx2(std::uint8_t const* first,
     __m128i sum = _mm_add_epi32(_mm256_castsi256_si128(total), _mm256_extracti128_si256(total, 1));
     sum = _mm_hadd_epi32(sum, sum);
     sum = _mm_hadd_epi32(sum, sum);
-    return _mm_cvtsi128_si32(sum);
+    return _mm_cvtsi128_si32(sum) +
+           packed_dot_range(first, second, vector_bytes, USEARCH_Q4_PACKED_BYTES);
 }
 #endif
 
@@ -288,6 +303,14 @@ static bool dump_search(usearch_q4_dense_t::search_result_t& result, std::uint32
 
 extern "C" {
 
+size_t usearch_q4_dimensions(void) {
+    return USEARCH_Q4_DIMENSIONS;
+}
+
+size_t usearch_q4_record_bytes(void) {
+    return USEARCH_Q4_RECORD_BYTES;
+}
+
 char const* usearch_q4_version(void) {
     return "2.26.2";
 }
@@ -434,10 +457,10 @@ int usearch_q4_add(usearch_q4_index_t* wrapper, uint8_t const* record,
     }
 }
 
-static int search_record(
+int usearch_q4_search_record(
     usearch_q4_index_t const* wrapper, uint8_t const* record,
-    size_t wanted, uint32_t* ids, float* distances, size_t* found,
-    bool exact, char* error, size_t error_capacity) {
+    size_t wanted, int exact, uint32_t* ids, float* distances, size_t* found,
+    char* error, size_t error_capacity) {
     clear_error(error, error_capacity);
     if (!wrapper || !found || (wanted && (!ids || !distances))) {
         set_error(error, error_capacity, "invalid search argument");
@@ -452,7 +475,7 @@ static int search_record(
         std::size_t requested = (std::min)(wanted, wrapper->index.size());
         auto result = wrapper->index.search(
             reinterpret_cast<i8_t const*>(record), requested,
-            usearch_q4_dense_t::any_thread(), exact);
+            usearch_q4_dense_t::any_thread(), exact != 0);
         if (!result) {
             set_search_error(result.error.release(), wrapper->index.limits().threads_search,
                              error, error_capacity);
@@ -468,26 +491,10 @@ static int search_record(
     }
 }
 
-int usearch_q4_search_record(
-    usearch_q4_index_t const* wrapper, uint8_t const* record,
-    size_t wanted, uint32_t* ids, float* distances, size_t* found,
-    char* error, size_t error_capacity) {
-    return search_record(wrapper, record, wanted, ids, distances, found,
-                         false, error, error_capacity);
-}
-
-int usearch_q4_exact_search_record(
-    usearch_q4_index_t const* wrapper, uint8_t const* record,
-    size_t wanted, uint32_t* ids, float* distances, size_t* found,
-    char* error, size_t error_capacity) {
-    return search_record(wrapper, record, wanted, ids, distances, found,
-                         true, error, error_capacity);
-}
-
-static int search_by_id(
+int usearch_q4_search_by_id(
     usearch_q4_index_t const* wrapper, uint32_t id,
-    size_t wanted, uint32_t* ids, float* distances, size_t* found,
-    bool exact, char* error, size_t error_capacity) {
+    size_t wanted, int exact, uint32_t* ids, float* distances, size_t* found,
+    char* error, size_t error_capacity) {
     clear_error(error, error_capacity);
     if (!wrapper || !found || (wanted && (!ids || !distances))) {
         set_error(error, error_capacity, "invalid search argument");
@@ -506,7 +513,7 @@ static int search_by_id(
                                     : wanted + 1;
         auto result = wrapper->index.search(
             reinterpret_cast<i8_t const*>(record_at(wrapper->index, id)), requested,
-            usearch_q4_dense_t::any_thread(), exact);
+            usearch_q4_dense_t::any_thread(), exact != 0);
         if (!result) {
             set_search_error(result.error.release(), wrapper->index.limits().threads_search,
                              error, error_capacity);
@@ -520,22 +527,6 @@ static int search_by_id(
         set_error(error, error_capacity, "unknown exception searching USearch index");
         return 0;
     }
-}
-
-int usearch_q4_search_by_id(
-    usearch_q4_index_t const* wrapper, uint32_t id,
-    size_t wanted, uint32_t* ids, float* distances, size_t* found,
-    char* error, size_t error_capacity) {
-    return search_by_id(wrapper, id, wanted, ids, distances, found,
-                        false, error, error_capacity);
-}
-
-int usearch_q4_exact_search_by_id(
-    usearch_q4_index_t const* wrapper, uint32_t id,
-    size_t wanted, uint32_t* ids, float* distances, size_t* found,
-    char* error, size_t error_capacity) {
-    return search_by_id(wrapper, id, wanted, ids, distances, found,
-                        true, error, error_capacity);
 }
 
 int usearch_q4_cosine_by_id(

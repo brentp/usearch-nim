@@ -1,0 +1,26 @@
+# Build output. The nimble tasks write everything under build/.
+/build/
+nimcache/
+nimblecache/
+nimbledeps/
+
+# Object and library artifacts from the C++ adapter.
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# Binaries Nim drops beside the source when --out: is not given.
+/tests/test_usearch_q4
+/bench/bench_q4
+
+# Serialized indexes produced by ad-hoc runs.
+*.usearch
+
+# Editor and OS noise.
+*~
+*.swp
+.DS_Store

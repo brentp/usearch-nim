@@ -8,11 +8,32 @@
 extern "C" {
 #endif
 
+/* Coordinates per record. Override at build time, for example
+   -DUSEARCH_Q4_DIMENSIONS=4096. Must be positive and even, because two
+   coordinates share each packed byte. When building through the Nim module use
+   -d:usearchQ4Dimensions=N instead: it sets both sides from one value.
+
+   The choice is fixed per build, not per index. Records are fixed-size values
+   and the metric is compiled around this count. An index serialized by one
+   build is rejected by a build with a different setting, because the record
+   size is checked on open. */
+#ifndef USEARCH_Q4_DIMENSIONS
+#define USEARCH_Q4_DIMENSIONS 3072
+#endif
+
+#if (USEARCH_Q4_DIMENSIONS) <= 0 || ((USEARCH_Q4_DIMENSIONS) % 2) != 0
+#error "USEARCH_Q4_DIMENSIONS must be a positive even number"
+#endif
+
 enum {
-    USEARCH_Q4_DIMENSIONS = 3072,
-    USEARCH_Q4_PACKED_BYTES = 1536,
-    USEARCH_Q4_RECORD_BYTES = 1540,
+    USEARCH_Q4_PACKED_BYTES = (USEARCH_Q4_DIMENSIONS) / 2,
+    USEARCH_Q4_RECORD_BYTES = USEARCH_Q4_PACKED_BYTES + 4,
 };
+
+/* Report the values this build was compiled with, so a caller can verify that
+   its own constants agree. */
+size_t usearch_q4_dimensions(void);
+size_t usearch_q4_record_bytes(void);
 
 typedef struct usearch_q4_index usearch_q4_index_t;
 
@@ -47,24 +68,15 @@ int usearch_q4_add(
     usearch_q4_index_t* index, uint8_t const* record,
     uint32_t* assigned_id, char* error, size_t error_capacity);
 
+/* exact != 0 scans every record instead of walking the HNSW graph. */
 int usearch_q4_search_record(
     usearch_q4_index_t const* index, uint8_t const* record,
-    size_t wanted, uint32_t* ids, float* distances, size_t* found,
-    char* error, size_t error_capacity);
-
-int usearch_q4_exact_search_record(
-    usearch_q4_index_t const* index, uint8_t const* record,
-    size_t wanted, uint32_t* ids, float* distances, size_t* found,
+    size_t wanted, int exact, uint32_t* ids, float* distances, size_t* found,
     char* error, size_t error_capacity);
 
 int usearch_q4_search_by_id(
     usearch_q4_index_t const* index, uint32_t id,
-    size_t wanted, uint32_t* ids, float* distances, size_t* found,
-    char* error, size_t error_capacity);
-
-int usearch_q4_exact_search_by_id(
-    usearch_q4_index_t const* index, uint32_t id,
-    size_t wanted, uint32_t* ids, float* distances, size_t* found,
+    size_t wanted, int exact, uint32_t* ids, float* distances, size_t* found,
     char* error, size_t error_capacity);
 
 int usearch_q4_cosine_by_id(

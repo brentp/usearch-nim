@@ -1,8 +1,25 @@
 import std/[cpuinfo, os]
 
+const Q4Dimensions* {.intdefine: "usearchQ4Dimensions".} = 3072
+  ## Coordinates per record, set at build time with
+  ## `-d:usearchQ4Dimensions=N`. Must be positive and even, since two
+  ## coordinates share each packed byte.
+  ##
+  ## The value is fixed per build, not per index: records are fixed-size values
+  ## and the C++ metric is compiled around this count. An index written by one
+  ## build fails to open under a build with a different setting, because
+  ## `openQ4Index` checks the stored record size.
+
+when Q4Dimensions <= 0 or Q4Dimensions mod 2 != 0:
+  {.error: "usearchQ4Dimensions must be a positive even number".}
+
 const sourceDir = currentSourcePath.parentDir
 {.compile: sourceDir / "usearch_q4_native.cpp".}
 {.passC: "-I\"" & sourceDir / "vendor" & "\"".}
+# One value drives both sides. If Nim and the adapter disagreed on the record
+# size the mismatch would be silent memory corruption, so the C++ dimension is
+# always derived from the Nim constant rather than set independently.
+{.passC: "-DUSEARCH_Q4_DIMENSIONS=" & $Q4Dimensions.}
 # Apple dropped libstdc++ from the SDK; clang there links the C++ runtime as
 # -lc++. Everywhere else the adapter needs libstdc++ explicitly, because the
 # module is meant to be importable from a plain C-backend Nim project.
@@ -14,7 +31,6 @@ when defined(UsearchScalarQ4):
   {.passC: "-DUSEARCH_Q4_DISABLE_AVX2=1".}
 
 const
-  Q4Dimensions* = 3072
   Q4PackedBytes* = Q4Dimensions div 2
   Q4RecordBytes* = Q4PackedBytes + sizeof(uint32)
   DefaultConnectivity* = 32
@@ -59,21 +75,14 @@ proc cAdd(handle: pointer; record: ptr uint8; assignedId: ptr uint32;
           error: ptr char; errorCapacity: csize_t): cint
   {.importc: "usearch_q4_add", cdecl.}
 proc cSearchRecord(handle: pointer; record: ptr uint8; wanted: csize_t;
-                   ids: ptr uint32; distances: ptr float32; found: ptr csize_t;
-                   error: ptr char; errorCapacity: csize_t): cint
+                   exact: cint; ids: ptr uint32; distances: ptr float32;
+                   found: ptr csize_t; error: ptr char;
+                   errorCapacity: csize_t): cint
   {.importc: "usearch_q4_search_record", cdecl.}
-proc cExactSearchRecord(handle: pointer; record: ptr uint8; wanted: csize_t;
-                        ids: ptr uint32; distances: ptr float32; found: ptr csize_t;
-                        error: ptr char; errorCapacity: csize_t): cint
-  {.importc: "usearch_q4_exact_search_record", cdecl.}
-proc cSearchById(handle: pointer; id: uint32; wanted: csize_t;
+proc cSearchById(handle: pointer; id: uint32; wanted: csize_t; exact: cint;
                  ids: ptr uint32; distances: ptr float32; found: ptr csize_t;
                  error: ptr char; errorCapacity: csize_t): cint
   {.importc: "usearch_q4_search_by_id", cdecl.}
-proc cExactSearchById(handle: pointer; id: uint32; wanted: csize_t;
-                      ids: ptr uint32; distances: ptr float32; found: ptr csize_t;
-                      error: ptr char; errorCapacity: csize_t): cint
-  {.importc: "usearch_q4_exact_search_by_id", cdecl.}
 proc cCosineById(handle: pointer; first, second: uint32; cosine: ptr float32;
                  error: ptr char; errorCapacity: csize_t): cint
   {.importc: "usearch_q4_cosine_by_id", cdecl.}
@@ -99,6 +108,27 @@ proc cMemory(handle: pointer): MemoryStats
 
 proc cSearchThreads(handle: pointer): csize_t
   {.importc: "usearch_q4_search_threads", cdecl.}
+
+proc cDimensions(): csize_t {.importc: "usearch_q4_dimensions", cdecl.}
+proc cRecordBytes(): csize_t {.importc: "usearch_q4_record_bytes", cdecl.}
+
+# A caller who forces -DUSEARCH_Q4_DIMENSIONS through their own --passC would
+# override what this module sets, and the two sides would lay records out
+# differently. That is silent memory corruption, so check once at startup
+# rather than trusting the build.
+if cDimensions().int != Q4Dimensions or cRecordBytes().int != Q4RecordBytes:
+  raise newException(UsearchError,
+    "usearch_q4 build mismatch: Nim was built for " & $Q4Dimensions &
+    " dimensions (" & $Q4RecordBytes & "-byte records) but the C++ adapter " &
+    "reports " & $cDimensions() & " (" & $cRecordBytes() & "-byte records); " &
+    "set the dimension with -d:usearchQ4Dimensions=N only")
+
+proc nativeDimensions*(): int = cDimensions().int
+  ## Dimension count the C++ adapter was compiled with. Equals `Q4Dimensions`
+  ## in a correctly built module; the check above enforces that at startup.
+
+proc nativeRecordBytes*(): int = cRecordBytes().int
+  ## Record size the C++ adapter was compiled with. Equals `Q4RecordBytes`.
 
 proc defaultSearchThreads*(): int =
   ## Search-slot count used when `searchThreads` is not given.
@@ -244,65 +274,46 @@ proc collectNeighbors(ids: seq[uint32]; distances: seq[float32]; found: int): se
   for i in 0 ..< found:
     result[i] = Neighbor(id: ids[i], distance: distances[i])
 
-proc search*(index: Q4Index; record: Q4Record; wanted: int): seq[Neighbor] =
+proc checkWanted(index: Q4Index; wanted: int) =
   index.requireOpen
   if wanted < 0:
     raise newException(ValueError, "wanted neighbor count cannot be negative")
-  if wanted == 0:
-    return @[]
-  var ids = newSeq[uint32](wanted)
-  var distances = newSeq[float32](wanted)
-  var found: csize_t
-  var error: array[ErrorBufferBytes, char]
-  checked cSearchRecord(index.handle, record.raw, wanted.csize_t,
-    addr ids[0], addr distances[0], addr found, addr error[0],
-    ErrorBufferBytes.csize_t), error
-  result = collectNeighbors(ids, distances, found.int)
 
-proc exactSearch*(index: Q4Index; record: Q4Record; wanted: int): seq[Neighbor] =
-  index.requireOpen
-  if wanted < 0:
-    raise newException(ValueError, "wanted neighbor count cannot be negative")
+proc search*(index: Q4Index; record: Q4Record; wanted: int;
+             exact = false): seq[Neighbor] =
+  ## Nearest neighbors of `record`, which need not be in the index. Nothing is
+  ## excluded, so every hit is a stored record.
+  ##
+  ## `exact = false` walks the HNSW graph and returns an approximation.
+  ## `exact = true` scores every record instead, returning the true top
+  ## `wanted` in time linear in index size — for validation or small indexes.
+  index.checkWanted(wanted)
   if wanted == 0:
     return @[]
   var ids = newSeq[uint32](wanted)
   var distances = newSeq[float32](wanted)
   var found: csize_t
   var error: array[ErrorBufferBytes, char]
-  checked cExactSearchRecord(index.handle, record.raw, wanted.csize_t,
+  checked cSearchRecord(index.handle, record.raw, wanted.csize_t, cint(exact),
     addr ids[0], addr distances[0], addr found, addr error[0],
     ErrorBufferBytes.csize_t), error
-  result = collectNeighbors(ids, distances, found.int)
+  collectNeighbors(ids, distances, found.int)
 
-proc searchById*(index: Q4Index; id: uint32; wanted: int): seq[Neighbor] =
-  index.requireOpen
-  if wanted < 0:
-    raise newException(ValueError, "wanted neighbor count cannot be negative")
+proc searchById*(index: Q4Index; id: uint32; wanted: int;
+                 exact = false): seq[Neighbor] =
+  ## Nearest neighbors of the stored record `id`, which is excluded from its
+  ## own results. `exact` behaves as in `search`.
+  index.checkWanted(wanted)
   if wanted == 0:
     return @[]
   var ids = newSeq[uint32](wanted)
   var distances = newSeq[float32](wanted)
   var found: csize_t
   var error: array[ErrorBufferBytes, char]
-  checked cSearchById(index.handle, id, wanted.csize_t,
+  checked cSearchById(index.handle, id, wanted.csize_t, cint(exact),
     addr ids[0], addr distances[0], addr found, addr error[0],
     ErrorBufferBytes.csize_t), error
-  result = collectNeighbors(ids, distances, found.int)
-
-proc exactSearchById*(index: Q4Index; id: uint32; wanted: int): seq[Neighbor] =
-  index.requireOpen
-  if wanted < 0:
-    raise newException(ValueError, "wanted neighbor count cannot be negative")
-  if wanted == 0:
-    return @[]
-  var ids = newSeq[uint32](wanted)
-  var distances = newSeq[float32](wanted)
-  var found: csize_t
-  var error: array[ErrorBufferBytes, char]
-  checked cExactSearchById(index.handle, id, wanted.csize_t,
-    addr ids[0], addr distances[0], addr found, addr error[0],
-    ErrorBufferBytes.csize_t), error
-  result = collectNeighbors(ids, distances, found.int)
+  collectNeighbors(ids, distances, found.int)
 
 proc cosineById*(index: Q4Index; first, second: uint32): float32 =
   index.requireOpen

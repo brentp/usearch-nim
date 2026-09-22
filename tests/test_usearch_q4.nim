@@ -1,6 +1,11 @@
-import std/[math, os, sequtils, sha1, unittest]
+import std/[hashes, math, os, sequtils, strutils, unittest]
 
 import ../src/usearch_q4
+
+proc fingerprint(data: string): string =
+  ## Compact stand-in for the file contents, so a failed comparison prints a
+  ## short token instead of a megabyte of index bytes.
+  $data.len & ":" & toHex(cast[uint](hash(data)))
 
 proc pattern(seed: int): seq[int8] =
   result = newSeq[int8](Q4Dimensions)
@@ -26,6 +31,21 @@ suite "packed-Q4 USearch wrapper":
     expect UsearchError:
       discard fromBytes(corrupt)
 
+  test "record layout follows the configured dimension":
+    check Q4Dimensions > 0
+    check Q4Dimensions mod 2 == 0
+    check Q4PackedBytes == Q4Dimensions div 2
+    check Q4RecordBytes == Q4PackedBytes + 4
+    # Nim and the C++ adapter must agree, or the two lay records out
+    # differently and every read past the first is garbage.
+    check nativeDimensions() == Q4Dimensions
+    check nativeRecordBytes() == Q4RecordBytes
+    let record = packQ4(pattern(1))
+    check record.toBytes.len == Q4RecordBytes
+    check record.unpackQ4.len == Q4Dimensions
+    expect ValueError:
+      discard packQ4(pattern(1)[0 ..< Q4Dimensions - 2])
+
   test "packed cosine matches scalar cosine":
     for seed in 1 .. 16:
       let firstValues = pattern(seed)
@@ -46,7 +66,7 @@ suite "packed-Q4 USearch wrapper":
     expect ValueError:
       discard packQ4(newSeq[int8](Q4Dimensions))
     var invalid = pattern(2)
-    invalid[100] = 8
+    invalid[Q4Dimensions div 2] = 8
     expect ValueError:
       discard packQ4(invalid)
 
@@ -68,9 +88,9 @@ suite "packed-Q4 USearch wrapper":
         discard index.add(packQ4(pattern(seed)))
       index.save(path)
       index.close()
-    let expected = $secureHash(readFile(paths[0]))
+    let expected = fingerprint(readFile(paths[0]))
     for path in paths:
-      check $secureHash(readFile(path)) == expected
+      check fingerprint(readFile(path)) == expected
 
   test "default index serves concurrent searches":
     var index = createQ4Index(32)
@@ -124,7 +144,7 @@ suite "packed-Q4 USearch wrapper":
     check external[0].id in [4'u32, 5'u32]
     check abs(external[0].similarity - 1.0'f32) < 1e-6
 
-    let exactExternal = index.exactSearch(records[4], records.len + 5)
+    let exactExternal = index.search(records[4], records.len + 5, exact = true)
     check exactExternal.len == records.len
     var externalSeen = newSeq[bool](records.len)
     for i, neighbor in exactExternal:
@@ -136,7 +156,7 @@ suite "packed-Q4 USearch wrapper":
         check exactExternal[i - 1].distance <= neighbor.distance
     check externalSeen.allIt(it)
 
-    let exactById = index.exactSearchById(4, records.len + 5)
+    let exactById = index.searchById(4, records.len + 5, exact = true)
     check exactById.len == records.len - 1
     var byIdSeen = newSeq[bool](records.len)
     byIdSeen[4] = true
@@ -162,7 +182,7 @@ suite "packed-Q4 USearch wrapper":
         discard repeated.add(record)
       repeated.reserve(28)
       repeated.save(repeatedPath)
-      check $secureHash(readFile(path)) == $secureHash(readFile(repeatedPath))
+      check fingerprint(readFile(path)) == fingerprint(readFile(repeatedPath))
 
     block:
       var loaded = openQ4Index(path)
@@ -174,7 +194,7 @@ suite "packed-Q4 USearch wrapper":
         let exact = loaded.cosineById(4, neighbor.id)
         check abs(neighbor.similarity - exact) < 1e-6
       check abs(loaded.cosineById(0, 2) - records[0].cosine(records[2])) < 1e-6
-      let exact = loaded.exactSearchById(4, 3)
+      let exact = loaded.searchById(4, 3, exact = true)
       check exact.len == 3
       check exact[0].id == 5
       for neighbor in exact:
@@ -189,7 +209,7 @@ suite "packed-Q4 USearch wrapper":
       for neighbor in neighbors:
         let exact = viewed.cosineById(8, neighbor.id)
         check abs(neighbor.similarity - exact) < 1e-6
-      let exact = viewed.exactSearch(records[8], 2)
+      let exact = viewed.search(records[8], 2, exact = true)
       check exact.len == 2
       check exact[0].id in [8'u32, 9'u32]
       expect UsearchError:

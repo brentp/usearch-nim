@@ -1,139 +1,122 @@
-# Minimal packed-Q4 USearch wrapper
+# usearch-q4
 
-This directory is self-contained and can be moved into another repository. It
-wraps USearch 2.26.2 for a packed-Q4 nearest-neighbor prefilter and
-intentionally does not expose USearch's general vector API.
+A minimal Nim wrapper around [USearch](https://github.com/unum-cloud/usearch)
+for 4-bit-quantized vectors, with an exact integer cosine metric. It does not
+expose USearch's general vector API.
+
+```nim
+import usearch_q4
+
+proc sampleVector(s: int): Q4Record =
+  # Coordinates are signed 4-bit values
+  # we just generate fake data here.
+  var coords = newSeq[int8](Q4Dimensions)
+  for i in 0 ..< Q4Dimensions:
+    coords[i] = int8((i * (s + 1)) mod 15 - 7)
+  packQ4(coords)
+
+var index = createQ4Index(1000)
+for id in 0 ..< 1000:
+  doAssert index.add(sampleVector(id)) == uint32(id)  # IDs assigned 0, 1, 2, ...
+
+for n in index.searchById(0, 3):   # nearest to a stored record, itself excluded
+  echo n.id, "  ", n.similarity    # similarity is 1 - distance
+
+# Query with a vector that is not in the index. Pack it the same way, then
+# hand the record to `search`; nothing is excluded, so all 3 hits are stored
+# records.
+let probe = sampleVector(4242)
+for n in index.search(probe, 3):
+  echo n.id, "  ", n.similarity
+
+# `exact = true` scores every record instead of walking the graph, giving the
+# true top 3 in linear time. Both search procs take it.
+for n in index.search(probe, 3, exact = true):
+  echo n.id, "  ", n.similarity
+
+echo index.cosineById(0, 1)        # exact cosine, not the graph's estimate
+
+index.save("vectors.usearch")
+var reopened = openQ4Index("vectors.usearch", memoryMap = true)
+```
 
 ## Packed record
 
-Each record contains exactly 3,072 signed Q4 coordinates:
+Each record holds `Q4Dimensions` coordinates, two per byte — low nibble first,
+values `-7` to `+7` (`0x8` is invalid) — followed by a little-endian `uint32`
+sum of squares. The metric accumulates the dot product in `int32` and returns
+`1 - dot/sqrt(sumsq_a*sumsq_b)`. USearch stores records as opaque `i8` bytes;
+its own `i8` quantizer and cosine metric are never used.
 
-- two two's-complement values from `-7` through `+7` per byte;
-- low nibble first, then high nibble;
-- nibble `0x8` is invalid because `-8` is outside the quantizer;
-- 1,536 coordinate bytes followed by a little-endian `uint32` sum of squares;
-- 1,540 bytes total.
+`Q4Dimensions` defaults to 3072 and is set at build time with
+`-d:usearchQ4Dimensions=N`, which must be positive and even. One define drives
+both the Nim and C++ sides. It is fixed per build rather than per index,
+because records are fixed-size values and the metric compiles around the count;
+an index is rejected on open by a build configured differently.
 
-The native metric accumulates the signed dot product in `int32` and returns
-`1 - dot/sqrt(sumsq_a*sumsq_b)`. USearch stores the record as opaque `i8`
-data; its built-in `i8` quantizer and cosine metric are never used.
+## Behavior
 
-## SIMD dispatch
+**Concurrent search.** Searches draw from a fixed pool sized by `searchThreads`
+at create/open time, and one finding no free slot fails rather than queuing.
+The default is one slot per core (~33 KB each, independent of index size); read
+the effective value from `index.searchThreads`. Adding is single-threaded.
 
-**No compiler flags are needed to get AVX2.** The AVX2 kernel carries its own
-`__attribute__((target("avx2")))`, so it compiles under any x86 GCC or Clang
-whatever the `-march` baseline, and `choose_packed_dot` picks it once per
-process via `__builtin_cpu_supports("avx2")`. A plain `nim c -d:release` build
-therefore runs AVX2 on an AVX2 host and the scalar kernel elsewhere, from one
-binary. Both kernels compute the same integer dot product, and every distance
-goes through the same selection: approximate search, exact search, `cosine`,
-and `cosineById` alike.
+**Exact search** (`exact = true` on either search proc) scans the whole index
+in linear time, returning the true top `wanted` — for validation or small
+sets. Defaults are `M=32`, `efConstruction=400`, `efSearch=80`.
 
-Call `metricImplementation()` to see which kernel is live; it returns `"avx2"`
-or `"scalar"`.
+## SIMD
 
-Do **not** add `-march=native`, `-mavx2`, or similar. They buy nothing here and
-they break the fallback: on an AVX-512 host, `-march=native` auto-vectorizes
-`packed_dot_scalar` itself into AVX-512, so the runtime dispatch still selects
-"scalar" on an older processor and then faults with SIGILL on the very machines
-that path exists to serve. Leave the architecture baseline alone.
+**No compiler flags are needed for AVX2.** The kernel carries its own
+`__attribute__((target("avx2")))` and is selected once per process via
+`__builtin_cpu_supports`, so one binary runs AVX2 where available and a scalar
+fallback elsewhere. Both compute the same integer dot product, on every path —
+approximate, exact, and `cosine`. `metricImplementation()` reports which is
+live.
 
-Compile with `-d:UsearchScalarQ4` to force the scalar kernel for validation;
-that is how the two implementations get cross-checked on an AVX2 host. The
-equivalent macro for building `usearch_q4_native.cpp` directly is
-`-DUSEARCH_Q4_DISABLE_AVX2=1`. On non-x86 targets, and on compilers other than
-GCC and Clang (MSVC included), the dispatch compiles out and the scalar kernel
-is always used.
+Do **not** add `-march=native` or `-mavx2`. They gain nothing and break the
+fallback: on an AVX-512 host `-march=native` auto-vectorizes the *scalar* kernel
+into AVX-512, so dispatch still picks "scalar" on an older processor and then
+faults with SIGILL on exactly the machines that path exists to serve.
 
-## API
+Build with `-d:UsearchScalarQ4` to force the scalar kernel for validation.
 
-`src/usearch_q4.nim` provides:
+## Build
 
-- `packQ4`, `unpackQ4`, `fromBytes`, `toBytes`, and exact packed cosine;
-- `createQ4Index` and `openQ4Index`;
-- sequential `add`, assigning zero-based `uint32` sample IDs;
-- approximate `search` and `searchById`, with self removed from ID queries;
-- exhaustive `exactSearch` and `exactSearchById`, also with self removed from
-  ID queries;
-- exact `cosineById` for candidate admission;
-- `metricImplementation` and `version` for the live SIMD kernel and pinned
-  USearch release;
-- reserve, save, load, memory-mapped view, and memory/size metadata, including
-  `searchThreads` for the effective concurrent-search limit.
-
-Sequential IDs let the wrapper disable USearch's key-to-slot hash table. They
-also allow `searchById` without retaining a second copy of all packed records.
-Indexes containing nonsequential keys are rejected on open.
-
-Construction uses one add thread and fixed insertion order. Every insertion is
-pinned to USearch thread context 0, because each context owns a private RNG
-that chooses a node's HNSW level: letting an add draw any free slot would make
-the serialized graph a function of `searchThreads`, and so of the building
-host's core count. The tests require byte-identical serialized indexes from
-repeated builds and across `searchThreads` values. Cross-toolchain
-reproducibility still requires validation.
-
-## Concurrent search
-
-USearch serves each in-flight search from a fixed pool of slots sized at
-create/open time by `searchThreads`. A search that finds no free slot fails
-outright rather than queuing, so an undersized pool turns into a flood of
-errors rather than contention. `createQ4Index` and `openQ4Index` therefore
-default `searchThreads` to `defaultSearchThreads()`, one slot per detected
-core; a slot costs roughly 33 KB regardless of index size. Raise it when more
-threads than that search one index at once, and read back the effective value
-with `index.searchThreads`. Adding is always single-threaded.
-
-The selected defaults are `M=32`, `efConstruction=400`, and `efSearch=80`.
-Exact searches scan the full index and are intended for validation or small
-cohorts; they do not use the HNSW graph and take linear time per query.
-Reciprocal top-40 filtering, the cosine floors, positional rescue, candidate
-deduplication, panel metadata, and exact relatedness scoring remain outside this
-wrapper.
-
-## Build and test
-
-The Nim module compiles the C++ adapter and links the C++ standard library
-(`-lc++` on macOS, `-lstdc++` elsewhere). No installed USearch library is
-required, and the module stays importable from a C-backend Nim project.
+Compiles the C++ adapter and links the C++ standard library (`-lc++` on macOS,
+`-lstdc++` elsewhere). No installed USearch is required, and the module stays
+importable from a C-backend Nim project.
 
 ```bash
-cd usearch-nim
-nimble test
+nimble test     # test suite
+nimble bench    # synthetic sizing and throughput benchmark
 ```
 
-The test task selects Clang because this development host has `clang++` but no
-`g++` command. The module itself does not depend on Clang; remove `--cc:clang`
-from the task when using Nim's default configured C++ compiler.
+Both write under `build/`. No compiler is pinned: `config.nims` uses whatever
+Nim is configured for, falling back to Clang only where there is no `g++`.
 
-A synthetic sizing and throughput smoke benchmark is available as:
+A 10,000-sample run built in 34.3 s and queried all 40-neighbor lists in 15.5 s,
+producing an 18,122,748-byte index — about 1,812 bytes per sample. Random
+vectors, so these are smoke-test figures.
 
-```bash
-nim c --cc:clang -d:release -r bench/bench_q4.nim 10000
-```
+## Persistence
 
-On the development host, the 10,000-sample synthetic run with the selected
-production parameters took 37.585 seconds to build and 16.486 seconds to query
-all 40-neighbor lists. USearch reported 33,634,560 bytes in memory and an
-18,122,748-byte serialized index, or about 1,812 serialized bytes per sample.
-The workload uses random sketches, so these are implementation smoke-test
-figures rather than a production throughput forecast.
+USearch serializes a metric identifier rather than a function pointer, so
+`openQ4Index` restores the packed-Q4 metric after each load or view, having
+first checked record size, scalar type, and sequential IDs. Save to a temporary
+file and rename atomically. Recording how the vectors were produced, alongside
+the HNSW parameters, is the caller's job.
 
-The three vendored USearch headers and license are under `src/vendor/`, inside
-`srcDir` so that `nimble install` ships them with the module. The pinned
-upstream version is recorded in `src/vendor/USearch-VERSION`.
+## License
 
-## Persistence constraints
+The wrapper — everything outside `src/vendor/` — is MIT; see [`LICENSE`](LICENSE).
 
-USearch serializes its built-in metric identifier, not a custom function
-pointer. `openQ4Index` therefore restores the packed-Q4 metric after every load
-or memory-mapped view and verifies the record size, scalar type, and sequential
-IDs before returning the index.
-
-The caller should save to a temporary file and atomically rename it. A
-caller-side sidecar still needs to record and validate the panel, allele
-frequencies, projection version and seed, caller settings, sample manifest,
-HNSW parameters, and checksums.
-
-USearch is Apache-2.0 licensed; the wrapper source is MIT-licensed. Retain
-`src/vendor/USearch-LICENSE` when redistributing it.
+`src/vendor/usearch/` holds three Apache-2.0 headers from USearch v2.26.2,
+which stay under that license. Apache-2.0 permits this inside a larger MIT
+work, and the conditions are met: the full license ships as
+[`src/vendor/USearch-LICENSE`](src/vendor/USearch-LICENSE) (§4a); the headers
+are unmodified, so no change notices are required (§4b) and their notices are
+intact (§4c) — per-file SHA-256 digests in
+[`src/vendor/README.md`](src/vendor/README.md) make that checkable; and USearch
+ships no `NOTICE` file at this version, so §4d does not apply. When bumping the
+pinned version, refresh those digests and recheck for a `NOTICE`.
