@@ -1,4 +1,4 @@
-version = "0.1.0"
+version = "0.1.1"
 author = "Brent Pedersen"
 description = "Minimal packed-Q4 USearch wrapper with an exact integer cosine metric"
 license = "MIT"

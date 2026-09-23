@@ -48,7 +48,7 @@ sum of squares. The metric accumulates the dot product in `int32` and returns
 `1 - dot/sqrt(sumsq_a*sumsq_b)`. USearch stores records as opaque `i8` bytes;
 its own `i8` quantizer and cosine metric are never used.
 
-`Q4Dimensions` defaults to 3072 and is set at build time with
+`Q4Dimensions` defaults to 4096 and is set at build time with
 `-d:usearchQ4Dimensions=N`, which must be positive and even. One define drives
 both the Nim and C++ sides. It is fixed per build rather than per index,
 because records are fixed-size values and the metric compiles around the count;

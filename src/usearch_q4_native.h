@@ -18,7 +18,7 @@ extern "C" {
    build is rejected by a build with a different setting, because the record
    size is checked on open. */
 #ifndef USEARCH_Q4_DIMENSIONS
-#define USEARCH_Q4_DIMENSIONS 3072
+#define USEARCH_Q4_DIMENSIONS 4096
 #endif
 
 #if (USEARCH_Q4_DIMENSIONS) <= 0 || ((USEARCH_Q4_DIMENSIONS) % 2) != 0

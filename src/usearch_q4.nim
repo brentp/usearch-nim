@@ -1,6 +1,6 @@
 import std/[cpuinfo, os]
 
-const Q4Dimensions* {.intdefine: "usearchQ4Dimensions".} = 3072
+const Q4Dimensions* {.intdefine: "usearchQ4Dimensions".} = 4096
   ## Coordinates per record, set at build time with
   ## `-d:usearchQ4Dimensions=N`. Must be positive and even, since two
   ## coordinates share each packed byte.
